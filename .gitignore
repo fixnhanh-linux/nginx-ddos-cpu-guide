@@ -1,0 +1,12 @@
+# Runtime output
+*.log
+/report*.txt
+/triage*.txt
+/tmp/
+
+# Editor / OS
+.DS_Store
+*.swp
+*~
+.idea/
+.vscode/
