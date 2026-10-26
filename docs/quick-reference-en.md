@@ -103,3 +103,37 @@ pools. Use [linux-malware-check](https://github.com/fixnhanh-linux/linux-malware
 - Block large IP ranges or your CDN.
 - Raise `max_children` without checking RAM.
 - Disable the firewall to "test".
+
+## 9. Console works, SSH doesn't
+
+Provider console (VNC/serial) bypasses the network, firewall and `sshd` — so it
+proves the box is alive and the problem is on the SSH path. Check in this order:
+
+| Symptom from your side | Likely cause | Check in console |
+|---|---|---|
+| timeout | firewall / fail2ban ban / provider ACL | `nft list ruleset`, `iptables -S`, `fail2ban-client status sshd` |
+| connection refused | `sshd` down or on another port | `ss -ltnp \| grep :22`, `systemctl status ssh` |
+| hangs at `expecting SSH2_MSG_KEX…` | MTU / `sshd` cannot fork | `dmesg -T \| tail`, `ping -M do -s 1400` |
+| `Permission denied` with correct password | `/etc/nologin`, faillock, expired account | `ls -l /etc/nologin`, `faillock --user <user>` |
+| logs in then kicked out | disk / inode full | `df -h`, `df -i` |
+
+Quick recovery from the console:
+
+```bash
+nft insert rule inet filter input ip saddr <YOUR_IP> tcp dport 22 accept
+fail2ban-client set sshd unbanip <YOUR_IP>
+mkdir -p /etc/ssh/sshd_config.d
+printf 'MaxStartups 100:30:200\n' > /etc/ssh/sshd_config.d/99-emergency.conf
+sshd -t && systemctl reload ssh
+
+# if sshd cannot start at all: temporary listener on another port
+/usr/sbin/sshd -p 2222 -o PidFile=/run/sshd-emergency.pid -o MaxStartups=100:30:200
+```
+
+`MaxStartups 10:30:100` (default) drops new SSH connections with 30% probability
+once 10 unauthenticated connections are open — the classic reason SSH fails
+during a flood while the console still works. Also check
+`nf_conntrack: table full, dropping packet` in `dmesg`.
+
+Keep the console tab open until SSH works again, and always run `sshd -t`
+before reloading.

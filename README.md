@@ -1,24 +1,68 @@
 # Nginx bị DDoS / CPU cao — playbook chẩn đoán & xử lý
 
-![nginx](https://img.shields.io/badge/nginx-1.18%2B-009639?logo=nginx&logoColor=white)
-![php](https://img.shields.io/badge/PHP--FPM-7.4%2B-777BB4?logo=php&logoColor=white)
-![license](https://img.shields.io/badge/license-MIT-green)
+[![nginx](https://img.shields.io/badge/nginx-1.18%2B-009639?logo=nginx&logoColor=white)](https://nginx.org/)
+[![php](https://img.shields.io/badge/PHP--FPM-7.4%2B-777BB4?logo=php&logoColor=white)](https://www.php.net/)
+[![license](https://img.shields.io/badge/license-MIT-green)](LICENSE)
+[![PRs](https://img.shields.io/badge/PRs-welcome-brightgreen)](https://github.com/fixnhanh-linux/nginx-ddos-cpu-guide/pulls)
+[![Vietnamese](https://img.shields.io/badge/ng%C3%B4n%20ng%E1%BB%AF-Ti%E1%BA%BFng%20Vi%E1%BB%87t-red)](README.md)
 
-Playbook thực chiến để trả lời 3 câu hỏi khi web server `CPU 100%`, `load` vọt
-cao, site chậm hoặc trả `502/504`:
+**Playbook thực chiến** cho lúc web server `CPU 100%`, `load` vọt cao, site chậm
+hoặc trả `502/504`.
 
-1. **CPU đang bị tiêu vào đâu** — traffic thật, DDoS lớp 7, DDoS lớp 4, hay
-   không phải traffic (malware, DB, I/O)?
-2. **Ai đang tấn công** — IP nào, URL nào, User-Agent nào, bao nhiêu request/s?
-3. **Chặn thế nào cho đúng** — không tự bắn chân, không chặn nhầm CDN, không
-   làm mất SSH.
+Trả lời 3 câu hỏi, theo đúng thứ tự:
 
-Kèm 2 script chỉ đọc, chạy được ngay trên server production.
+| # | Câu hỏi | Trả lời ở |
+|---|---------|-----------|
+| 1 | **CPU đang bị tiêu vào đâu?** traffic thật, DDoS L7, DDoS L4, hay malware/DB/I/O | [mục 1](#1-bốn-loại-cpu-cao) · [mục 3](#3-chẩn-đoán-60-giây) |
+| 2 | **Ai đang tấn công?** IP, URL, User-Agent, request/s | [mục 4](#4-đọc-access-log-để-tìm-kẻ-tấn-công) · [mục 5](#5-các-kiểu-tấn-công-và-dấu-hiệu) |
+| 3 | **Chặn thế nào cho đúng?** không chặn nhầm CDN, không mất SSH | [mục 6](#6-chặn-tạm-thời--đúng-thứ-tự) |
+
+Kèm 2 script **chỉ đọc**, chạy được ngay trên production, và 3 file cấu hình mẫu.
+
+> [!TIP]
+> Đang cháy máy? Nhảy thẳng tới [TL;DR 10 phút](#0-tldr--10-phút-đầu-tiên) hoặc
+> chạy `sudo ./scripts/triage.sh` rồi quay lại đọc tiếp.
 
 **English:** [one-page cheat sheet](docs/quick-reference-en.md)
 
+---
+
+## Tra nhanh theo triệu chứng
+
+| Bạn thấy gì? | Khả năng cao nhất | Đọc mục |
+|--------------|-------------------|---------|
+| CPU 100%, rps rất cao, 1–3 IP chiếm phần lớn | HTTP flood L7 | [5](#5-các-kiểu-tấn-công-và-dấu-hiệu), [6.3](#63-bước-2--rate-limit-trong-nginx-hiệu-quả-nhất-với-l7) |
+| CPU cao, rps bình thường, process lạ | Malware / miner | [9](#9-cpu-cao-nhưng-không-phải-do-traffic) |
+| `%sys` cao, `syn-recv` hàng nghìn | SYN flood L4 | [6.7](#67-bước-6--l4-thì-gọi-provider) |
+| `%wa` cao, swap đầy, có OOM | Thiếu RAM / DB / I/O | [3.3](#33-ram-và-swap), [7.6](#76-database) |
+| `%steal` cao | VPS bị hàng xóm chiếm CPU | [3.2](#32-cpu-đang-tiêu-vào-đâu) |
+| Site trả 502/504 | PHP-FPM chết / hết worker | [7](#7-php-fpm-cpu-cao-do-code) |
+| `Reading` cao, nhiều kết nối mở lâu | Slowloris | [5](#5-các-kiểu-tấn-công-và-dấu-hiệu), [6.6](#66-bước-5--giảm-tải-để-giữ-site-sống) |
+| `429` hàng loạt sau khi bật rate limit | Rate limit quá chặt | [6.3](#63-bước-2--rate-limit-trong-nginx-hiệu-quả-nhất-với-l7) |
+| Log toàn `POST /wp-login.php` | Brute-force / credential stuffing | [5](#5-các-kiểu-tấn-công-và-dấu-hiệu) |
+| Top URL `/?s=<random>` | Search flood (WordPress) | [4.2](#42-cách-đọc-kết-quả) |
+| Đang dùng Cloudflare mà log toàn IP lạ | Thiếu `real_ip` | [6.5](#65-bước-4--nếu-có-cdnwaf-cloudflare-fastly-buny) |
+| Console provider vào được, SSH thì timeout/refused | IP bị chặn, `sshd` chết, `MaxStartups`, conntrack đầy | [6.8](#68-console-vào-được-ssh-không--vì-sao) |
+
+## Cây quyết định 30 giây
+
+```
+CPU cao?
+│
+├─ rps cao?  (curl /nginx_status, 2 lần cách 1s)
+│   ├─ CÓ ──> %sys cao? ──> SYN/TLS flood ────────────> mục 6.7 (provider)
+│   │                    └─ %usr cao? ──> HTTP flood ──> mục 4 + 6.3 + 6.4
+│   │
+│   └─ KHÔNG ─> %wa cao / swap đầy? ──────────────────> mục 3.3 + 7.6
+│                └─ process lạ, exe (deleted)? ───────> mục 9 (malware)
+│
+└─ Không rõ ──> chạy scripts/triage.sh, đọc bảng ở mục 3.2
+```
+
 **Mục lục**
 
+- [Tra nhanh theo triệu chứng](#tra-nhanh-theo-triệu-chứng)
+- [Cây quyết định 30 giây](#cây-quyết-định-30-giây)
 - [0. TL;DR — 10 phút đầu tiên](#0-tldr--10-phút-đầu-tiên)
 - [1. Bốn loại “CPU cao”](#1-bốn-loại-cpu-cao)
 - [2. Bộ công cụ](#2-bộ-công-cụ)
@@ -32,6 +76,9 @@ Kèm 2 script chỉ đọc, chạy được ngay trên server production.
 - [10. Sau sự cố](#10-sau-sự-cố)
 - [11. Chống tái diễn](#11-chống-tái-diễn)
 - [12. Runbook 15 lệnh](#12-runbook-15-lệnh)
+- [13. Case study: 12 phút dập flood](#13-case-study-12-phút-dập-flood)
+- [14. FAQ](#14-faq)
+- [15. Thuật ngữ](#15-thuật-ngữ)
 - [Phụ lục](#phụ-lục)
 
 ---
@@ -41,13 +88,14 @@ Kèm 2 script chỉ đọc, chạy được ngay trên server production.
 | Phút | Việc | Lệnh |
 |------|------|------|
 | 0–1 | Chụp toàn cảnh, **không reboot** | `sudo ./scripts/triage.sh` |
-| 1–3 | Xem CPU tiêu vào đâu | `mpstat -P ALL 1 5`, `top -b -n1 -o %CPU \| head -20` |
-| 3–5 | Đếm kết nối & request/s | `ss -s`, `curl -s 127.0.0.1/nginx_status` |
+| 1–3 | Xem CPU tiêu vào đâu | `mpstat -P ALL 1 5`<br>`top -b -n1 -o %CPU \| head -20` |
+| 3–5 | Đếm kết nối & request/s | `ss -s`<br>`curl -s 127.0.0.1/nginx_status` |
 | 5–8 | Tìm IP/URL/UA nổi bật | `sudo ./scripts/nginx-top.sh` |
 | 8–10 | Chặn tạm thời đúng thứ tự | [mục 6](#6-chặn-tạm-thời--đúng-thứ-tự) |
 
-Nguyên tắc số 1: **không reboot, không xóa log, không tắt firewall** trước khi
-chụp được bằng chứng. Reboot xong vẫn bị tấn công tiếp và mất dấu vết.
+> [!WARNING]
+> **Không reboot, không xóa log, không tắt firewall** trước khi chụp bằng chứng.
+> Reboot xong vẫn bị tấn công tiếp và bạn mất toàn bộ dấu vết.
 
 ---
 
@@ -64,8 +112,8 @@ chụp được bằng chứng. Reboot xong vẫn bị tấn công tiếp và m�
 
 Câu hỏi quyết định: **CPU cao có tương ứng với request/s cao không?**
 
-- Có → mục 4 và 5.
-- Không → mục 9 (malware) hoặc phần DB/I/O trong mục 7.6.
+- Có → [mục 4](#4-đọc-access-log-để-tìm-kẻ-tấn-công) và [mục 5](#5-các-kiểu-tấn-công-và-dấu-hiệu).
+- Không → [mục 9](#9-cpu-cao-nhưng-không-phải-do-traffic) (malware) hoặc phần DB/I/O trong [mục 7.6](#76-database).
 
 ---
 
@@ -93,14 +141,12 @@ Tùy chọn, rất đáng cài trên máy production:
 | `php-fpm` status page | Biết pool có bão hòa hay không |
 | `nginx stub_status` | Biết active connection và request/s |
 
-Repo này có 2 script:
+### Script trong repo
 
-| Script | Việc |
-|--------|------|
-| [`scripts/triage.sh`](scripts/triage.sh) | Chụp snapshot: CPU, RAM, disk, mạng, nginx, php-fpm, process, OOM |
-| [`scripts/nginx-top.sh`](scripts/nginx-top.sh) | Phân tích access log: top IP/URL/UA/status, POST flood, rps, dấu hiệu scanner |
-
-Cả hai **chỉ đọc**, không sửa cấu hình, không chặn gì.
+| Script | Việc | Chỉ đọc |
+|--------|------|:-------:|
+| [`scripts/triage.sh`](scripts/triage.sh) | Chụp snapshot: CPU, RAM, disk, mạng, nginx, php-fpm, process, OOM | ✅ |
+| [`scripts/nginx-top.sh`](scripts/nginx-top.sh) | Phân tích access log: top IP/URL/UA/status, POST flood, rps, dấu hiệu scanner | ✅ |
 
 ### Cấu trúc repo
 
@@ -156,8 +202,9 @@ mpstat -P ALL 1 5
 | `%steal` | Hypervisor lấy CPU | **VPS bị hàng xóm chiếm CPU**, không phải lỗi bạn |
 | `%soft` | Softirq mạng | Flood gói tin, NIC/ảo hóa |
 
-`%steal` > 5–10% kéo dài: mở ticket với nhà cung cấp VPS, tối ưu tại chỗ không
-giải quyết được.
+> [!NOTE]
+> `%steal` > 5–10% kéo dài: mở ticket với nhà cung cấp VPS. Tối ưu tại chỗ
+> không giải quyết được vấn đề này.
 
 ### 3.3 RAM và swap
 
@@ -258,7 +305,7 @@ echo "rps = $((b - a))"
 Kiểm tra cấu hình thực tế đang chạy và lỗi gần đây:
 
 ```bash
-nginx -T 2>/dev/null | grep -E 'worker_processes|worker_connections|keepalive_timeout|client_(header|body)_timeout|limit_(req|conn)' 
+nginx -T 2>/dev/null | grep -E 'worker_processes|worker_connections|keepalive_timeout|client_(header|body)_timeout|limit_(req|conn)'
 tail -100 /var/log/nginx/error.log
 ```
 
@@ -318,8 +365,41 @@ slow requests:        8
 | `max listen queue` lớn | Đã có lúc site sập/504 |
 | `slow requests` > 0 | Có request vượt `request_slowlog_timeout` → xem slowlog |
 
-**Tăng `max_children` không phải lúc nào cũng đúng.** Nếu code chậm, tăng
-`max_children` chỉ làm RAM đầy nhanh hơn và đẩy máy vào swap.
+> [!IMPORTANT]
+> **Tăng `max_children` không phải lúc nào cũng đúng.** Nếu code chậm, tăng
+> `max_children` chỉ làm RAM đầy nhanh hơn và đẩy máy vào swap.
+
+### 3.7 Một lệnh chụp tất cả
+
+```bash
+sudo ./scripts/triage.sh -o /tmp/triage-$(date +%F-%H%M).txt -n 20
+```
+
+Output mẫu (rút gọn, chạy thật trên một host 8 vCPU):
+
+```
+== TRIAGE - 2026-10-26T10:00:27+00:00 ==
+  host      : web-server-1
+  kernel    : Linux 6.8.0-147-generic
+  uptime    : up 3 hours, 32 minutes
+  virt      : vmware
+  run as    : uid=0
+
+== CPU va load ==
+  nproc     : 8
+  model     : Intel(R) Xeon(R) CPU E5-2686 v4 @ 2.30GHz
+  loadavg   : 0.16 0.09 0.07
+  load/core : 0.02
+
+== Mang ==
+  established 80/443 : 42
+  syn-recv           : 0
+  time-wait          : 118
+```
+
+Script còn in `mpstat`, top process, RAM/swap/OOM, disk, `iostat`, nginx
+`stub_status` + rps, PHP-FPM status + slowlog, và mục **“Dấu hiệu bất thường”**
+(`ld.so.preload`, process có `exe (deleted)`, systemd timer lạ).
 
 ---
 
@@ -330,8 +410,8 @@ slow requests:        8
 ```bash
 sudo ./scripts/nginx-top.sh
 
-# log khác vị trí / chỉ 100k dòng cuối / top 30
-sudo ./scripts/nginx-top.sh -f /var/log/nginx/example.com.access.log -m 100000 -n 30
+# log khác vị trí / chỉ 100k dòng cuối / top 30 / ngưỡng 500 req
+sudo ./scripts/nginx-top.sh -f /var/log/nginx/example.com.access.log -m 100000 -n 30 -b 500
 
 # ghi báo cáo ra file
 sudo ./scripts/nginx-top.sh -o /tmp/nginx-report.txt
@@ -350,6 +430,39 @@ Script tự nhận dạng log `combined`, tính cả request/s, và in:
 8. UA đáng ngờ (sqlmap, nikto, masscan, python-requests, Go-http-client…)
 9. Danh sách IP vượt ngưỡng request (mặc định > 300)
 
+Output mẫu với log giả lập 2.000 dòng (flood 3 IP + search flood + brute-force
+login + scanner 404):
+
+```
+== NGINX ACCESS LOG - /tmp/opencode/lg/access.log ==
+  dong phan tich : 2000
+  IP duy nhat    : 247
+  thoi gian      : 26/Oct/2026:03:00:00 +0700  ->  26/Oct/2026:03:09:19 +0700
+  request/s (tb) : 3.6
+  dong khong parse duoc: 0
+
+== PHAN BO STATUS ==
+    1800  2xx
+     200  4xx
+
+== TOP 3 IP THEO SO REQUEST ==
+      400 203.0.113.46
+      400 203.0.113.45
+      400 203.0.113.44
+
+== PATH CO NHIEU QUERY KHAC NHAU (cache-bypass / search flood) ==
+    1200 query khac nhau  /
+
+== USER-AGENT DANG NGO (scanner / tool) ==
+     1200 python-requests/2.31
+      200 Mozilla/5.0 zgrab/0.x
+
+== IP VUOT NGUONG > 300 REQUEST ==
+       400  203.0.113.46
+       400  203.0.113.45
+       400  203.0.113.44
+```
+
 ### 4.2 Cách đọc kết quả
 
 | Dấu hiệu trong báo cáo | Kết luận thường gặp |
@@ -364,6 +477,7 @@ Script tự nhận dạng log `combined`, tính cả request/s, và in:
 | 4xx chiếm 60–90% | Scanner hoặc flood vào URL không tồn tại |
 | `Reading` cao, rps thấp | Slowloris |
 | Không có UA + HTTP/1.0 | Tool cũ / botnet |
+| Nhiều query khác nhau trên cùng 1 path | Cache-bypass / search flood |
 
 ### 4.3 Lệnh thủ công tương đương
 
@@ -420,22 +534,46 @@ Ba điều cần chú ý: **cùng path + cùng UA**, **không referer**, **tần
 | **TLS handshake flood** | `SSL_do_handshake() failed` nhiều, CPU `%sys` cao | `ssl_session_cache`, edge |
 | **Botnet IP xoay vòng** | hàng nghìn IP, mỗi IP vài request | Chặn theo ASN/quốc gia, JS challenge |
 
-Điểm quan trọng: **L7 thì chặn ở nginx/WAF; L4 thì chặn ở provider.** Cố chặn
-SYN flood bằng `nginx limit_req` là vô nghĩa vì gói tin không bao giờ tới được
-HTTP layer.
+> [!IMPORTANT]
+> **L7 chặn ở nginx/WAF; L4 chặn ở provider.** Cố chặn SYN flood bằng
+> `nginx limit_req` là vô nghĩa vì gói tin không bao giờ tới được HTTP layer.
+
+### 5.1 Bảng “chữ ký” theo kiểu tấn công
+
+| Kiểu | Log/`ss` cho thấy | Cấu hình nên bật |
+|------|-------------------|------------------|
+| HTTP flood | 1 IP, 500 rps, UA cố định | `limit_req` 10 r/s |
+| Slowloris | 10k conn `Reading`, 5 rps | `client_header_timeout 10s`, `limit_conn 30` |
+| Login brute-force | 200 POST/phút vào `/wp-login.php` | `limit_req` 1 r/s + fail2ban |
+| Search flood | 50k URL `/?s=` khác nhau | cache + chặn `s=` rỗng |
+| Scanner | 404 `/.env`, `/vendor/` | WAF/UA block |
+| SYN flood | `syn-recv` 20k, `%sys` 70% | provider + syncookies |
 
 ---
 
 ## 6. Chặn tạm thời — đúng thứ tự
 
+```
+┌──────────────────────────────────────────────────────────────────────┐
+│  1. Bảo vệ SSH/admin  →  2. Rate limit  →  3. Chặn IP               │
+│  4. CDN/WAF           →  5. Giảm tải    →  6. L4: gọi provider      │
+└──────────────────────────────────────────────────────────────────────┘
+```
+
+Khóa mất SSH giữa lúc chặn là chuyện rất dễ xảy ra — xem
+[mục 6.8](#68-console-vào-được-ssh-không--vì-sao) để biết cách vào lại bằng
+console của provider.
+
 ### 6.1 Ba điều không được làm
 
-1. **Không chặn dải IP lớn** (ví dụ `/16`) — rất dễ chặn nhầm khách hàng, Google,
-   hoặc chính CDN của bạn.
-2. **Không chặn IP của Cloudflare/CDN** khi site đang đi qua CDN. Nếu đang dùng
-   Cloudflare mà chặn theo IP trong nginx, bạn sẽ chặn chính Cloudflare và
-   **sập toàn bộ site**.
-3. **Không tắt firewall rồi mở lại sau** — mất luôn lớp bảo vệ và có thể mất SSH.
+> [!CAUTION]
+> 1. **Không chặn dải IP lớn** (ví dụ `/16`) — rất dễ chặn nhầm khách hàng,
+>    Google, hoặc chính CDN của bạn.
+> 2. **Không chặn IP của Cloudflare/CDN** khi site đang đi qua CDN. Nếu đang
+>    dùng Cloudflare mà chặn theo IP trong nginx, bạn sẽ chặn chính Cloudflare
+>    và **sập toàn bộ site**.
+> 3. **Không tắt firewall** rồi mở lại sau — mất luôn lớp bảo vệ và có thể mất
+>    SSH.
 
 ### 6.2 Bước 1 — bảo vệ SSH và trang admin trước
 
@@ -501,7 +639,7 @@ Lưu ý:
 - `burst` quá thấp làm người dùng thật bị 429. Theo dõi log `limiting requests`
   để chỉnh.
 - Nếu site sau CDN: `$binary_remote_addr` là IP của CDN, rate limit sẽ áp cho
-  toàn bộ người dùng → phải cấu hình `real_ip` trước (xem 6.5).
+  toàn bộ người dùng → phải cấu hình `real_ip` trước (xem [6.5](#65-bước-4--nếu-có-cdnwaf-cloudflare-fastly-buny)).
 
 ### 6.4 Bước 3 — chặn IP cụ thể
 
@@ -572,7 +710,9 @@ set_real_ip_from 2400:cb00::/32;
 real_ip_header CF-Connecting-IP;
 ```
 
-Danh sách này thay đổi theo thời gian — hãy đồng bộ định kỳ từ URL chính thức.
+> [!WARNING]
+> Danh sách IP Cloudflare thay đổi theo thời gian. Hãy đồng bộ định kỳ từ
+> <https://www.cloudflare.com/ips/> — đừng copy một lần rồi để đó.
 
 ### 6.6 Bước 5 — giảm tải để giữ site sống
 
@@ -640,6 +780,197 @@ sysctl -w net.core.somaxconn=65535
 
 Ghi vào `/etc/sysctl.d/99-web.conf` nếu thấy hiệu quả.
 
+### 6.8 Console vào được, SSH không — vì sao?
+
+Tình huống rất hay gặp lúc đang bị flood: mở **web console** của nhà cung cấp
+(VNC / serial / “Emergency console”) thì đăng nhập được, nhưng `ssh user@ip` từ
+máy bạn thì `timeout`, `Connection refused`, hoặc treo ở dòng cuối `debug1:
+expecting SSH2_MSG_KEX_ECDH_REPLY`.
+
+Điều đó chứng minh **máy vẫn sống, kernel vẫn chạy, tài khoản vẫn đúng**. Vấn đề
+chỉ nằm ở một trong hai chặng: **đường mạng tới cổng 22** hoặc **riêng tiến
+trình `sshd`**.
+
+```
+Máy bạn ──► Internet ──► [provider ACL / anti-DDoS] ──► [firewall của bạn]
+                                                             │
+                                                             ▼
+                                                      sshd :22 ──► PAM ──► shell
+                                                         ✗
+Console ──► hypervisor (VNC/serial) ────────────────► getty/login ─────► shell
+```
+
+Console đi qua hypervisor, **không đi qua card mạng của VPS** → nó bỏ qua toàn bộ
+firewall, fail2ban, ACL của provider và cả `sshd`. Vì thế console là “cửa sau”
+để cứu máy — và cũng chính vì thế phải bảo vệ nó: mật khẩu mạnh, 2FA ở panel
+provider, không dùng chung mật khẩu với SSH.
+
+#### Bảng phân loại theo triệu chứng
+
+| Bạn thấy từ máy mình | Nguyên nhân hay gặp | Kiểm tra trong console |
+|---|---|---|
+| `Connection timed out` | Firewall/ACL chặn 22, fail2ban ban IP, IP bị null-route | `nft list ruleset`, `iptables -S`, `fail2ban-client status sshd` |
+| `Connection refused` | `sshd` không chạy, hoặc nghe cổng khác | `ss -ltnp \| grep ssh`, `systemctl status ssh` |
+| Kết nối được nhưng treo ở `expecting SSH2_MSG_KEX…` | MTU/PMTU, `sshd` không fork nổi process con | `dmesg -T \| tail`, `ping -M do -s 1400` |
+| `Permission denied` dù mật khẩu đúng | `/etc/nologin`, PAM `faillock`, tài khoản hết hạn, shell sai | `ls -l /etc/nologin`, `faillock --user <user>` |
+| Vào được rồi bị đá ra ngay | Disk/inode đầy, không ghi được `utmp`/log | `df -h`, `df -i` |
+| `ssh_exchange_identification: Connection closed` | `MaxStartups` đầy, `sshd` bị OOM kill | `journalctl -u ssh -n 50` |
+| Chỉ máy/mạng của bạn không vào được | IP của bạn bị chặn, IPv6 lỗi route | thử 4G, thử `ssh -4`, thử cổng khác |
+
+#### Kiểm tra trong console, theo thứ tự
+
+**1. `sshd` còn sống và nghe đúng cổng?**
+
+```bash
+systemctl status ssh 2>/dev/null || systemctl status sshd
+ss -ltnp | grep -E ':22\b|sshd'
+journalctl -u ssh -n 50 --no-pager 2>/dev/null || tail -50 /var/log/auth.log
+```
+
+Nếu service chết vì OOM, `dmesg` sẽ có `Killed process … (sshd)`. Khởi động lại
+sau khi đã chắc cấu hình đúng: `sshd -t && systemctl restart ssh`.
+
+**2. Firewall / fail2ban có chặn chính IP của bạn?**
+
+Đây là nguyên nhân số một: bạn tự khóa mình khi đang chặn flood.
+
+```bash
+nft list ruleset | grep -nE '22|ssh'
+iptables -S 2>/dev/null | grep -E '22|ssh'
+fail2ban-client status sshd 2>/dev/null
+ipset list 2>/dev/null | head -30
+cat /etc/hosts.deny 2>/dev/null
+```
+
+Gỡ đúng IP của mình (chỉ `/32`, đừng mở cả dải):
+
+```bash
+fail2ban-client set sshd unbanip 203.0.113.10
+```
+
+**3. SYN flood làm đầy `conntrack` / backlog**
+
+Khi `conntrack` đầy, kết nối SSH mới **bị drop trước khi tới `sshd`** — `sshd`
+vẫn “running”, console vẫn vào được, nhưng SSH từ ngoài thì timeout.
+
+```bash
+ss -s
+sysctl net.netfilter.nf_conntrack_count net.netfilter.nf_conntrack_max 2>/dev/null
+dmesg -T | tail -30
+```
+
+Tìm các dòng: `nf_conntrack: table full, dropping packet`,
+`Possible SYN flooding on port 443`.
+
+```bash
+# tăng tạm (mỗi entry ~300 byte RAM, 262144 entry ~ 80 MB)
+sysctl -w net.netfilter.nf_conntrack_max=262144
+sysctl -w net.ipv4.tcp_max_syn_backlog=65535
+```
+
+**4. Disk hoặc inode đầy**
+
+Log bị flood ghi rất nhanh; đầy `/var` làm `sshd` không ghi được session → đăng
+nhập xong bị đá ngay, trong khi console (không cần ghi `utmp` qua sshd) vẫn OK.
+
+```bash
+df -h / /var /tmp
+df -i /
+du -xh /var/log --max-depth=1 2>/dev/null | sort -h | tail
+```
+
+> [!CAUTION]
+> Đừng xóa log đang là bằng chứng. Copy ra chỗ khác trước
+> ([mục 10.1](#101-giữ-lại-gì)), rồi mới `journalctl --vacuum-size=200M` hoặc
+> xoay vòng log.
+
+**5. Cấu hình và giới hạn của `sshd`**
+
+```bash
+sshd -t
+sshd -T | grep -E '^(port|maxstartups|maxsessions|logingracetime|permitrootlogin|passwordauthentication|usepam|allowusers|allowgroups)'
+systemctl show ssh -p LimitNOFILE -p TasksMax 2>/dev/null
+```
+
+`MaxStartups 10:30:100` nghĩa là: sau 10 kết nối chưa xác thực, mỗi kết nối mới
+có 30% bị drop, và tối đa 100. Dưới flood, **lần SSH của bạn gần như chắc chắn
+bị drop** — đây là lý do kinh điển của “console vào được, SSH thì không”.
+
+**6. PAM và tài khoản**
+
+```bash
+ls -l /etc/nologin 2>/dev/null && cat /etc/nologin
+faillock --user <user> 2>/dev/null
+chage -l <user>
+getent passwd <user>
+```
+
+`/etc/nologin` xuất hiện khi script bảo trì/shutdown bị treo → **chỉ root** đăng
+nhập được, user thường bị từ chối dù mật khẩu đúng.
+
+**7. Phía nhà cung cấp**
+
+- Security group / cloud firewall (AWS SG, GCP firewall, Azure NSG) chặn 22.
+- Anti-DDoS scrubbing đang lọc nhầm cổng 22.
+- IP bị blackhole/null-route vì flood.
+- Elastic IP / NAT đổi địa chỉ sau reboot.
+
+#### Lấy lại SSH ngay từ console
+
+Làm theo thứ tự, **ít rủi ro trước**:
+
+```bash
+# 1) Mở cổng 22 cho đúng IP đang dùng (thay IP của bạn)
+nft insert rule inet filter input ip saddr 203.0.113.10 tcp dport 22 accept
+# hoặc: iptables -I INPUT -s 203.0.113.10 -p tcp --dport 22 -j ACCEPT
+
+# 2) Bỏ ban fail2ban
+fail2ban-client set sshd unbanip 203.0.113.10 2>/dev/null
+
+# 3) Nới MaxStartups bằng drop-in, không sửa file gốc
+mkdir -p /etc/ssh/sshd_config.d
+printf 'MaxStartups 100:30:200\nMaxSessions 20\nLoginGraceTime 20\n' \
+  > /etc/ssh/sshd_config.d/99-emergency.conf
+sshd -t && systemctl reload ssh
+
+# 4) Gỡ /etc/nologin nếu có
+rm -f /etc/nologin
+```
+
+Nếu `sshd` không khởi động được, mở một `sshd` tạm ở cổng khác để vào lấy dữ
+liệu (nhớ mở cổng đó trên firewall):
+
+```bash
+/usr/sbin/sshd -p 2222 -o PidFile=/run/sshd-emergency.pid -o MaxStartups=100:30:200
+ss -ltnp | grep 2222
+# từ máy bạn:
+ssh -p 2222 user@203.0.113.20
+```
+
+> [!WARNING]
+> Luôn chạy `sshd -t` trước khi `reload`/`restart`. `reload` không cắt các phiên
+> đang mở, nhưng nếu file cấu hình sai thì lần vào sau sẽ mất — và lúc đó bạn chỉ
+> còn console. **Đừng đóng tab console cho tới khi SSH vào lại được.**
+
+> [!TIP]
+> Nếu bạn đang chỉnh firewall qua SSH (không phải console), hãy tự hẹn giờ gỡ
+> rule để không tự khóa mình:
+>
+> ```bash
+> ( sleep 300; nft delete rule inet filter input handle <N> ) &
+> ```
+
+#### Phòng ngừa để không bị khóa ngoài lần sau
+
+- **Hai đường vào**: SSH 22 + một cổng dự phòng (2222) hoặc VPN/Tailscale.
+- `AllowUsers` / `AllowGroups`, chỉ dùng key; whitelist IP văn phòng và IP
+  monitoring trong fail2ban (`ignoreip`).
+- `MaxStartups 100:30:200` trên máy có nguy cơ bị flood.
+- Giữ một phiên `tmux`/`screen` mở khi đang chỉnh firewall, để nếu mất kết nối
+  vẫn quay lại được trạng thái cũ.
+- Giám sát **từ bên ngoài**: probe TCP 22 mỗi phút, alert khi không kết nối
+  được — đừng chỉ tin `systemctl status ssh`.
+
 ---
 
 ## 7. PHP-FPM: CPU cao do code
@@ -648,7 +979,7 @@ Nếu `%usr` cao, rps không cao và nginx không nghẽn, thủ phạm nằm tr
 
 ### 7.1 Status page nói gì
 
-Xem mục 3.6. Cách đọc nhanh:
+Xem [mục 3.6](#36-php-fpm-có-bão-hòa). Cách đọc nhanh:
 
 - `max children reached > 0` + `listen queue > 0` → **thiếu worker** (hoặc code
   giữ worker quá lâu).
@@ -828,12 +1159,13 @@ http {
 }
 ```
 
-Lưu ý: `gzip_comp_level 9` tiết kiệm băng thông nhưng **tốn CPU đáng kể** — trên
-máy đang quá tải, hạ về 4–5 hoặc tắt gzip cho nội dung đã nén.
+> [!TIP]
+> `gzip_comp_level 9` tiết kiệm băng thông nhưng **tốn CPU đáng kể** — trên máy
+> đang quá tải, hạ về 4–5 hoặc tắt gzip cho nội dung đã nén.
 
 ### 8.2 PHP-FPM
 
-Ngoài `max_children` (mục 7.3):
+Ngoài `max_children` ([mục 7.3](#73-max_children--tính-bằng-ram-không-bằng-cảm-giác)):
 
 ```ini
 emergency_restart_threshold = 10
@@ -1013,13 +1345,121 @@ ps -eo pid,args --sort=-pcpu | head; cat /etc/ld.so.preload 2>/dev/null
 
 ---
 
+## 13. Case study: 12 phút dập flood
+
+Site WordPress, VPS 8 vCPU / 8 GB, có Cloudflare nhưng **chưa bật proxy** (DNS
+trỏ thẳng IP gốc).
+
+| Giờ | Dấu hiệu | Việc đã làm | Kết quả |
+|-----|----------|-------------|---------|
+| 02:58 | Alert CPU 100%, load 38 | Mở SSH, chạy `triage.sh` | Có snapshot đầy đủ |
+| 03:00 | `%sys` 61%, `%usr` 33%, `steal` 0% | `ss -s`: 18.400 established | Nghi L7 |
+| 03:02 | 3 IP giữ 9.000 kết nối | `nginx-top.sh` | 3 IP chiếm 72% request |
+| 03:04 | UA `python-requests/2.31`, path `/?s=<random>` | Xác nhận search flood | Không phải traffic thật |
+| 03:06 | — | `deny` 3 IP + `limit_req 10r/s` | rps 8.100 → 2.400 |
+| 03:08 | CPU còn 64% | Bật micro-cache 10s | rps vào PHP giảm 91% |
+| 03:10 | CPU 12%, load 3.1 | Site phản hồi bình thường | Đã kiểm soát |
+| 03:12 | — | Chụp log, lưu `/root/incident-*` | Có bằng chứng |
+
+**Bài học**
+
+1. IP gốc lộ vì chưa bật proxy Cloudflare → flood đánh thẳng, WAF không thấy gì.
+2. 3 IP là đủ để làm sập site: không cần botnet lớn, chỉ cần không giới hạn
+   request/IP.
+3. `limit_req` + micro-cache là combo rẻ nhất, hiệu quả nhất cho L7.
+4. Sau sự cố: bật proxy Cloudflare, thêm rule rate limit cho `?s=`, và alert
+   theo rps thay vì chỉ theo CPU.
+
+---
+
+## 14. FAQ
+
+**Có nên reboot server ngay khi CPU 100%?**
+Không. Reboot không chặn được tấn công, lại xóa sạch trạng thái để chẩn đoán
+(`ss`, `top`, log trong RAM) và có thể khiến site downtime lâu hơn.
+
+**Chặn IP bằng nginx hay iptables/nftables?**
+L7 (request) → nginx, vì nginx hiểu HTTP và trả 403/429 nhẹ nhàng. L4 (gói tin)
+→ nftables/provider, vì nginx không bao giờ thấy gói tin đó. Với hàng nghìn IP,
+dùng set của nftables hoặc edge.
+
+**Tăng `worker_connections` có giúp không?**
+Chỉ khi error log có `worker_connections are not enough` hoặc `accepts` >
+`handled`. Nếu không, tăng chỉ tốn RAM.
+
+**CPU 100% nhưng rps rất thấp?**
+Đừng tối ưu nginx. Kiểm tra malware/miner, swap, DB, hoặc một process PHP bị
+treo. Xem [mục 9](#9-cpu-cao-nhưng-không-phải-do-traffic).
+
+**Console của nhà cung cấp vào được nhưng SSH thì không — bắt đầu từ đâu?**
+Từ console, kiểm tra theo thứ tự: `sshd` còn chạy không (`ss -ltnp | grep :22`),
+IP của bạn có bị firewall/fail2ban chặn không, `conntrack` có đầy không, disk có
+đầy không, rồi tới `MaxStartups`. Chi tiết ở
+[mục 6.8](#68-console-vào-được-ssh-không--vì-sao).
+
+**Dùng Cloudflare thì có cần `real_ip` không?**
+Bắt buộc. Không có `real_ip`, mọi request trông như đến từ IP Cloudflare: log
+vô dụng, rate limit áp sai, và `deny` có thể chặn cả CDN.
+
+**Bật rate limit 10r/s có làm mất khách thật không?**
+Với trang tĩnh thì 10r/s/IP là rất rộng. Rủi ro chính là CDN/proxy dùng chung
+IP, hoặc văn phòng nhiều người chung NAT. Theo dõi tỉ lệ 429 và tăng `burst`
+nếu cần.
+
+**Cache 10 giây có làm khách thấy dữ liệu cũ?**
+Có, 10 giây. Vì vậy chỉ cache trang public, không cache giỏ hàng/thanh toán/
+trang đăng nhập (đã có `$skip_cache` trong file mẫu).
+
+**Log 20 GB thì phân tích bao lâu?**
+`nginx-top.sh` dùng `awk` nên khoảng 1–2 triệu dòng/giây trên VPS thường. Nếu
+quá lớn, dùng `-m 500000` để chỉ phân tích 500k dòng cuối.
+
+**`max_children` nên đặt bao nhiêu?**
+Tính theo RSS thật, không theo cảm giác: xem [mục 7.3](#73-max_children--tính-bằng-ram-không-bằng-cảm-giác).
+
+**Có cần tcpdump không?**
+Chỉ khi cần bằng chứng hoặc phân tích L4. `tcpdump` trên máy đang flood làm
+tăng tải, hãy giới hạn `-c` và `-w` ra disk riêng.
+
+---
+
+## 15. Thuật ngữ
+
+| Thuật ngữ | Nghĩa |
+|-----------|-------|
+| **rps** | Requests per second — số request mỗi giây |
+| **L4 / L7** | Tấn công lớp transport (TCP/UDP) / lớp ứng dụng (HTTP) |
+| **Slowloris** | Mở nhiều kết nối, gửi header rất chậm để giữ worker |
+| **Cache bypass** | Thêm query ngẫu nhiên để không trúng cache |
+| **Upstream** | Backend mà nginx chuyển request tới (PHP-FPM, app server) |
+| **Pool** | Nhóm worker PHP-FPM phục vụ một site |
+| **Worker** | Process con xử lý request (nginx hoặc PHP-FPM) |
+| **stub_status** | Module nginx xuất thống kê kết nối/request |
+| **`real_ip`** | Module khôi phục IP thật khi đi qua proxy/CDN |
+| **WAF** | Web Application Firewall — lọc request độc ở lớp ứng dụng |
+| **JS challenge** | Trang kiểm tra trình duyệt để chặn bot |
+| **steal** | CPU bị hypervisor lấy cho máy khác (VPS) |
+| **`MaxStartups`** | Giới hạn số kết nối SSH chưa xác thực trước khi `sshd` bắt đầu drop |
+| **conntrack** | Bảng theo dõi kết nối của netfilter; đầy thì gói tin mới bị drop |
+| **fail2ban** | Daemon đọc log và tự thêm rule chặn IP có hành vi xấu |
+| **console (VNC/serial)** | Terminal qua hypervisor, không phụ thuộc mạng của VPS |
+
+---
+
 ## Phụ lục
 
 ### A. Mẫu cấu hình đầy đủ
 
-- [`conf/nginx-ratelimit.conf`](conf/nginx-ratelimit.conf) — rate limit + slowloris
-- [`conf/nginx-microcache.conf`](conf/nginx-microcache.conf) — micro-cache 10s
-- [`conf/php-fpm-tuning.conf`](conf/php-fpm-tuning.conf) — pool tuning + slowlog + status
+| File | Nội dung |
+|------|----------|
+| [`conf/nginx-ratelimit.conf`](conf/nginx-ratelimit.conf) | Rate limit + chống slowloris |
+| [`conf/nginx-microcache.conf`](conf/nginx-microcache.conf) | Micro-cache 10s |
+| [`conf/php-fpm-tuning.conf`](conf/php-fpm-tuning.conf) | Pool tuning + slowlog + status |
+
+> [!NOTE]
+> Đây là **snippet tham khảo**, không phải file thay thế. Mỗi file ghi rõ phần
+> nào thuộc `http {}`, phần nào thuộc `server {}`. Luôn `nginx -t` trước khi
+> reload.
 
 ### B. Bảng ngưỡng nhanh
 
@@ -1054,7 +1494,7 @@ ps -eo pid,args --sort=-pcpu | head; cat /etc/ld.so.preload 2>/dev/null
   khi đổ lỗi cho code.
 - Tấn công thường nhắm vào WordPress (`wp-login.php`, `xmlrpc.php`, `?s=`) vì
   chi phí thấp và số lượng site lớn.
-- Nếu dùng CDN trong nước, hãy xác nhận CDN có `real_ip` header riêng và cấu
+- Nếu dùng CDN trong nước, hãy xác nhận CDN có header real IP riêng và cấu
   hình đúng, tránh chặn nhầm toàn bộ dải IP của CDN.
 
 ---
@@ -1066,6 +1506,9 @@ Pull request hoặc issue đều được hoan nghênh. Khi thêm lệnh/cấu h
 - Ghi rõ **phiên bản** nginx/PHP đã kiểm chứng.
 - Không đưa vào lệnh có thể làm mất dữ liệu mà không cảnh báo.
 - Giữ phần “chỉ đọc” của `scripts/` — không thêm hành động chặn/xóa.
+
+Nếu playbook này giúp bạn dập được một ca flood, hãy ⭐ repo để người khác tìm
+thấy nhanh hơn.
 
 ## License
 
